@@ -43,7 +43,7 @@ SESSION_SECONDS = max(60, min(int(os.getenv("SESSION_SECONDS", "3600")), 86400))
 MAX_RAM_MB = max(64, min(int(os.getenv("CHILD_RAM_MB", "256")), 2048))
 MAX_CPU_SECONDS = max(20, min(int(os.getenv("CHILD_CPU_SECONDS", "120")), 3600))
 
-app = FastAPI(title="Cloud Project Manager PTY Runner", version="0.9.3", docs_url=None, redoc_url=None)
+app = FastAPI(title="Cloud Project Manager PTY Runner", version="0.9.6", docs_url=None, redoc_url=None)
 
 
 class StartCode(BaseModel):
@@ -243,7 +243,7 @@ def _unzip_safely(content: bytes, destination: pathlib.Path) -> str:
 @app.get("/health")
 def health(authorization: Optional[str] = Header(default=None)):
     _require_auth(authorization)
-    return {"ok": True, "version": "0.9.3", "capabilities": ["python3", "pty", "recent_output", "exit_code", "file_upload"]}
+    return {"ok": True, "version": "0.9.6", "capabilities": ["python3", "pty", "recent_output", "exit_code", "file_upload"]}
 
 
 @app.post("/sessions")
@@ -331,7 +331,7 @@ def events(session_id: str, after: int = 0, wait_ms: int = 0, authorization: Opt
             "latest_cursor": last_cursor, "tail": tail,
             "output_age_seconds": last_output_age,
             "uptime_seconds": uptime_seconds,
-            "output_present": output_present, "runner_version": "0.9.3"}
+            "output_present": output_present, "runner_version": "0.9.6"}
 
 
 @app.post("/sessions/{session_id}/input")

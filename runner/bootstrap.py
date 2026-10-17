@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import venv
 
 PY_PACKAGES = {
     'requests': 'requests', 'httpx': 'httpx', 'aiohttp': 'aiohttp',
@@ -67,8 +68,17 @@ def python_imports(code: str) -> set[str]:
 
 
 def local_names(root: Path) -> set[str]:
-    names = {p.stem for p in root.rglob('*.py') if len(p.relative_to(root).parts) <= 3}
-    names.update(p.name for p in root.rglob('*') if p.is_dir() and len(p.relative_to(root).parts) <= 3 and (p/'__init__.py').exists())
+    names = set()
+    for here, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {'node_modules', '__pycache__'}]
+        if len(Path(here).relative_to(root).parts) > 3:
+            dirs[:] = []
+            continue
+        for filename in files:
+            if filename.endswith('.py'):
+                names.add(Path(filename).stem)
+        if '__init__.py' in files:
+            names.add(Path(here).name)
     return names
 
 
@@ -111,52 +121,90 @@ def install(cmd: list[str], env: dict):
         raise RuntimeError('فشل تحميل إحدى المكتبات؛ رمز الخروج '+str(result))
 
 
-def python_setup(root: Path, entry: Path) -> dict:
-    show('🔎 جاري فحص مكتبات Python...')
-    wanted = requirements(root)
-    known_local = local_names(root)
+def python_setup(root: Path, entry: Path) -> tuple[dict, str]:
+    """Create a per-session venv and install with THAT interpreter.
+
+    Both automated installs and `os.system("pip install ...")` from the submitted
+    program target the same venv. Never assume that pip's --user path is on sys.path.
+    """
+    show('🐍 تجهيز بيئة Python 3 مستقلة لجلسة التشغيل...')
+    venv_dir = root / '.cpm_venv'
+    venv.EnvBuilder(with_pip=True, system_site_packages=True, clear=False).create(str(venv_dir))
+    interpreter = venv_dir / 'bin' / 'python'
+    if not interpreter.is_file():
+        raise RuntimeError('لم نتمكن من إنشاء مفسر Python للجلسة')
     env = os.environ.copy()
-    dest = root/'.cpm_deps'
-    dest.mkdir(exist_ok=True)
-    # Do not silently fetch lookalike packages from PyPI for arbitrary imports.
+    env['VIRTUAL_ENV'] = str(venv_dir)
+    env['PATH'] = str(venv_dir / 'bin') + os.pathsep + env.get('PATH', '/usr/local/bin:/usr/bin:/bin')
+    env['HOME'] = str(root)
+    env['PYTHONNOUSERSITE'] = '1'
+    # Venv site-packages must take precedence over any PYTHONPATH left behind.
+    env.pop('PYTHONPATH', None)
+    env['PIP_CONFIG_FILE'] = os.devnull
+    env['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'
+    env['PIP_NO_INPUT'] = '1'
+    wanted = requirements(root)
+    existing = local_names(root)
     unknown = set()
-    for py in list(root.rglob('*.py'))[:100]:
-        if '.cpm_deps' in py.parts:
+    to_check = set()
+    # Exclude the venv: scanning its bundled pip sources as user code caused
+    # false dependency detections and unnecessary installs.
+    count = 0
+    for here, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in {'.cpm_venv', '.cpm_deps', '.venv', 'node_modules', '__pycache__'} and not d.startswith('.')]
+        if len(Path(here).relative_to(root).parts) > 3:
+            dirs[:] = []
             continue
-        try:
-            content = py.read_text('utf-8')
-        except (OSError, UnicodeError):
+        for filename in files:
+            if not filename.endswith('.py') or count >= 100:
+                continue
+            count += 1
+            try:
+                content = (Path(here) / filename).read_text('utf-8-sig')
+            except (OSError, UnicodeError):
+                continue
+            for imp in python_imports(content):
+                if imp not in existing and imp not in sys.stdlib_module_names:
+                    to_check.add(imp)
+        if count >= 100:
+            break
+    # Check packages using the SAME interpreter that will execute main.py.
+    def installed(module: str) -> bool:
+        if not re.fullmatch(r'[A-Za-z_]\w*', module):
+            return False
+        probe = subprocess.run(
+            [str(interpreter), '-c', 'import importlib.util,sys;sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)', module],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=12)
+        return probe.returncode == 0
+    req_names = {re.split(r'==|\[', w, 1)[0].lower().replace('_', '-') for w in wanted}
+    for imp in sorted(to_check):
+        if installed(imp):
             continue
-        for imp in python_imports(content):
-            if imp in known_local or imp in sys.stdlib_module_names:
-                continue
-            if imp not in PY_PACKAGES:
-                if importlib.util.find_spec(imp) is None:
-                    unknown.add(imp)
-                continue
-            package = PY_PACKAGES[imp]
-            if importlib.util.find_spec(imp) is None and package.lower() not in [x.lower() for x in wanted]:
-                wanted.append(package)
+        if imp not in PY_PACKAGES:
+            unknown.add(imp)
+            continue
+        package = PY_PACKAGES[imp]
+        if package.lower().replace('_', '-') not in req_names:
+            wanted.append(package)
+            req_names.add(package.lower().replace('_', '-'))
     if unknown:
-        show('⚠️ مكتبات غير معروفة (لن ننزّل أسماء تخمينية): '+', '.join(sorted(unknown)[:10]))
+        show('⚠️ مكتبات غير معروفة؛ لن نثبتها تلقائياً: ' + ', '.join(sorted(unknown)[:10]))
     wanted = list(dict.fromkeys(wanted))
     if wanted:
-        show('📦 سيتم تثبيت '+str(len(wanted))+' مكتبات: '+', '.join(wanted[:12]))
-        for idx,pkg in enumerate(wanted,1):
-            show(f'⏳ [{idx}/{len(wanted)}] تنزيل {pkg} ...')
-            installer = [sys.executable,'-m','pip','install','--disable-pip-version-check',
-                         '--no-input','--no-cache-dir','--only-binary=:all:',
-                         '--retries','1','--timeout','12','--target',str(dest),
-                         '--index-url','https://pypi.org/simple',pkg]
-            safe_env = {'PATH':env.get('PATH','/usr/local/bin:/usr/bin:/bin'),
-                        'HOME':str(root),'LANG':'C.UTF-8','PYTHONIOENCODING':'utf-8',
-                        'PIP_CONFIG_FILE':os.devnull,'PIP_DISABLE_PIP_VERSION_CHECK':'1'}
-            install(installer,safe_env)
-            show(f'✅ [{idx}/{len(wanted)}] اكتمل تثبيت {pkg}')
+        show('📦 فحص/تثبيت ' + str(len(wanted)) + ' مكتبات: ' + ', '.join(wanted[:12]))
+        for idx, package in enumerate(wanted, 1):
+            show(f'⏳ [{idx}/{len(wanted)}] تجهيز {package}...')
+            install([str(interpreter), '-m', 'pip', 'install', '--disable-pip-version-check',
+                     '--no-input', '--no-cache-dir', '--only-binary=:all:', '--retries', '1',
+                     '--timeout', '12', '--index-url', 'https://pypi.org/simple', package], env)
+            show(f'✅ [{idx}/{len(wanted)}] اكتمل {package}')
     else:
-        show('✅ كل مكتبات Python المطلوبة متوفرة')
-    env['PYTHONPATH'] = str(dest)+os.pathsep+str(root)
-    return env
+        show('✅ جميع المكتبات المطلوبة متاحة لنفس مفسر Python')
+    still_missing = [module for module in sorted(to_check) if module in PY_PACKAGES and not installed(module)]
+    if still_missing:
+        raise RuntimeError('مكتبات ثُبتت لكن Python لا يراها: ' + ', '.join(still_missing))
+    show('✅ تم التأكد من بيئة Python والمكتبات')
+    return env, str(interpreter)
 
 
 def javascript_setup(root: Path, entry: Path) -> dict:
@@ -213,9 +261,9 @@ def main():
     language=sys.argv[3]
     try:
         if language=='python':
-            env=python_setup(root,entry)
+            env, interpreter = python_setup(root,entry)
             show('🚀 اكتمل التحضير — بدء Python...')
-            os.execve(sys.executable,[sys.executable,'-u',str(entry)],env)
+            os.execve(interpreter,[interpreter,'-u',str(entry)],env)
         elif language=='javascript':
             env=javascript_setup(root,entry)
             show('🚀 اكتمل التحضير — بدء Node.js...')
