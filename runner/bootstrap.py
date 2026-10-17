@@ -104,7 +104,7 @@ def install(cmd: list[str], env: dict):
                             text=True, bufsize=1)
     for line in proc.stdout:
         line = line.strip()
-        if line and ('ERROR:' in line or 'error ' in line.lower() or 'Successfully installed' in line):
+        if line and ('ERROR:' in line or 'error ' in line.lower() or 'Successfully installed' in line or line.startswith(('Downloading ', 'Installing collected packages:', 'Collecting ', 'Requirement already satisfied:'))):
             show('  '+line[:230])
     result = proc.wait()
     if result:

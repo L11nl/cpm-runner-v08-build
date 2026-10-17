@@ -13,6 +13,7 @@ import os
 import pathlib
 import pty
 import resource
+import re
 import select
 import shutil
 import signal
@@ -42,7 +43,7 @@ SESSION_SECONDS = max(60, min(int(os.getenv("SESSION_SECONDS", "3600")), 86400))
 MAX_RAM_MB = max(64, min(int(os.getenv("CHILD_RAM_MB", "256")), 2048))
 MAX_CPU_SECONDS = max(20, min(int(os.getenv("CHILD_CPU_SECONDS", "120")), 3600))
 
-app = FastAPI(title="Cloud Project Manager PTY Runner", version="0.9.1", docs_url=None, redoc_url=None)
+app = FastAPI(title="Cloud Project Manager PTY Runner", version="0.9.3", docs_url=None, redoc_url=None)
 
 
 class StartCode(BaseModel):
@@ -71,6 +72,7 @@ class Session:
     finished: bool = False
     truncated: bool = False
     char_count: int = 0
+    output_updated: float = field(default_factory=time.monotonic)
 
     def append(self, output: str):
         if not output:
@@ -84,6 +86,7 @@ class Session:
                 return
             output = output[:MAX_LOG_CHARS - self.char_count]
             self.char_count += len(output)
+            self.output_updated = time.monotonic()
             self.cursor += 1
             self.events.append((self.cursor, output))
             if len(self.events) > MAX_EVENTS:
@@ -142,7 +145,10 @@ def _require_auth(authorization: Optional[str]):
 
 def _child_limits(js=False):
     os.setsid()
-    ram = (8 * 1024 * 1024 * 1024) if js else (MAX_RAM_MB * 1024 * 1024)  # V8 reserves a large VIRTUAL address space; Railway cgroup limits actual RAM
+    # RLIMIT_AS limits virtual address space, not actual RSS. pip, Python extension
+    # modules and V8 can reserve far more virtual memory than their actual RSS.
+    # The Railway cgroup enforces actual memory use; child CPU/file/time are capped.
+    ram = (8 * 1024 * 1024 * 1024) if js else (4 * 1024 * 1024 * 1024)
     resource.setrlimit(resource.RLIMIT_AS, (ram, ram))
     resource.setrlimit(resource.RLIMIT_CPU, (MAX_CPU_SECONDS, MAX_CPU_SECONDS + 1))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
@@ -237,7 +243,7 @@ def _unzip_safely(content: bytes, destination: pathlib.Path) -> str:
 @app.get("/health")
 def health(authorization: Optional[str] = Header(default=None)):
     _require_auth(authorization)
-    return {"ok": True, "version": "0.9.1"}
+    return {"ok": True, "version": "0.9.3", "capabilities": ["python3", "pty", "recent_output", "exit_code", "file_upload"]}
 
 
 @app.post("/sessions")
@@ -278,7 +284,16 @@ async def start_file(file: UploadFile = File(...), authorization: Optional[str] 
             except UnicodeDecodeError:
                 raise HTTPException(400, 'The code file must be UTF-8')
             language = detect_kind(name,text)
-            entry = 'main.js' if language=='javascript' else 'main.py'
+            # Preserve the uploaded .py/.js basename so __file__, traceback and
+            # relative imports behave like an ordinary Python/Node invocation.
+            # .txt needs a language-appropriate extension for Node ESM support.
+            original_name = file.filename or ''
+            safe_basename = pathlib.Path(original_name).name
+            if (original_name==safe_basename and
+                    re.fullmatch(r'[\w .()-]{1,100}\.(?:py|js)',safe_basename,re.I)):
+                entry=safe_basename
+            else:
+                entry='main.js' if language=='javascript' else 'main.py'
             (workdir / entry).write_text(text,encoding='utf-8')
         else:
             entry = _unzip_safely(content, workdir)
@@ -305,9 +320,18 @@ def events(session_id: str, after: int = 0, wait_ms: int = 0, authorization: Opt
         state = "finished" if s.finished or s.process.poll() is not None else "running"
         exit_code = s.process.poll()
         last_cursor = s.cursor
+        tail = "".join(text for _, text in s.events)[-3500:]
+        last_output_age = round(time.monotonic() - s.output_updated, 1)
+        uptime_seconds = round(time.monotonic() - s.born, 1)
+        output_present = s.char_count > 0
+    # A snapshot tail means that manual Telegram refresh remains meaningful even
+    # after the event cursor has advanced. There is NO claim that silence = failure.
     return {"session_id": session_id, "state": state, "exit_code": exit_code,
             "events": messages[:80], "cursor": messages[min(len(messages), 80)-1]["cursor"] if messages else after,
-            "latest_cursor": last_cursor}
+            "latest_cursor": last_cursor, "tail": tail,
+            "output_age_seconds": last_output_age,
+            "uptime_seconds": uptime_seconds,
+            "output_present": output_present, "runner_version": "0.9.3"}
 
 
 @app.post("/sessions/{session_id}/input")
