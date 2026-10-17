@@ -29,6 +29,8 @@ from typing import Optional
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from .bootstrap import detect_kind
+BOOTSTRAP_PATH = str(pathlib.Path(__file__).with_name("bootstrap.py"))
 
 MAX_SCRIPT_BYTES = 256_000
 MAX_ARCHIVE_BYTES = 8_000_000
@@ -40,7 +42,7 @@ SESSION_SECONDS = max(60, min(int(os.getenv("SESSION_SECONDS", "3600")), 86400))
 MAX_RAM_MB = max(64, min(int(os.getenv("CHILD_RAM_MB", "256")), 2048))
 MAX_CPU_SECONDS = max(20, min(int(os.getenv("CHILD_CPU_SECONDS", "120")), 3600))
 
-app = FastAPI(title="Cloud Project Manager PTY Runner", version="0.1.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="Cloud Project Manager PTY Runner", version="0.9.1", docs_url=None, redoc_url=None)
 
 
 class StartCode(BaseModel):
@@ -138,9 +140,9 @@ def _require_auth(authorization: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _child_limits():
+def _child_limits(js=False):
     os.setsid()
-    ram = MAX_RAM_MB * 1024 * 1024
+    ram = (8 * 1024 * 1024 * 1024) if js else (MAX_RAM_MB * 1024 * 1024)  # V8 reserves a large VIRTUAL address space; Railway cgroup limits actual RAM
     resource.setrlimit(resource.RLIMIT_AS, (ram, ram))
     resource.setrlimit(resource.RLIMIT_CPU, (MAX_CPU_SECONDS, MAX_CPU_SECONDS + 1))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
@@ -162,7 +164,7 @@ def _launch(workdir: pathlib.Path, argv: list[str]):
         attrs[3] &= ~termios.ECHO
         termios.tcsetattr(slave, termios.TCSANOW, attrs)
         env = {
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PATH": "/usr/local/bin:/usr/bin:/bin" + (":"+os.path.dirname(shutil.which("node")) if shutil.which("node") and not shutil.which("node").startswith(("/usr/local/bin/","/usr/bin/","/bin/")) else ""),
             "LANG": "C.UTF-8",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
@@ -175,7 +177,7 @@ def _launch(workdir: pathlib.Path, argv: list[str]):
         try:
             child = subprocess.Popen(
                 argv, cwd=str(workdir), stdin=slave, stdout=slave, stderr=slave,
-                env=env, close_fds=True, preexec_fn=_child_limits,
+                env=env, close_fds=True, preexec_fn=lambda: _child_limits(argv[-1]=='javascript'),
             )
         except Exception:
             os.close(master)
@@ -225,27 +227,29 @@ def _unzip_safely(content: bytes, destination: pathlib.Path) -> str:
         target.parent.mkdir(parents=True, exist_ok=True)
         with archive.open(item) as source, target.open("wb") as output:
             shutil.copyfileobj(source, output, length=1024 * 1024)
-    for name in ("main.py", "bot.py", "app.py", "run.py"):
+    for name in ("main.py", "bot.py", "app.py", "run.py", "index.js", "main.js", "bot.js", "app.js"):
         matches = sorted(destination.rglob(name))
         if matches:
             return str(matches[0].relative_to(destination))
-    raise HTTPException(400, "ZIP needs main.py, bot.py, app.py or run.py")
+    raise HTTPException(400, "ZIP needs main.py, bot.py, app.py, run.py, index.js, main.js, bot.js or app.js")
 
 
 @app.get("/health")
 def health(authorization: Optional[str] = Header(default=None)):
     _require_auth(authorization)
-    return {"ok": True, "version": "0.1.0"}
+    return {"ok": True, "version": "0.9.1"}
 
 
 @app.post("/sessions")
 def start_code(body: StartCode, authorization: Optional[str] = Header(default=None)):
     _require_auth(authorization)
-    if body.language != "python":
-        raise HTTPException(400, "Currently supported: python")
+    if body.language.lower() not in ("python", "py", "javascript", "js"):
+        raise HTTPException(400, "Supported: python, javascript")
+    language = 'javascript' if body.language.lower() in ('js','javascript') else 'python'
     workdir = _workspace()
-    (workdir / "main.py").write_text(body.code, encoding="utf-8")
-    return _launch(workdir, ["python3", "-u", "main.py"])
+    filename = 'main.js' if language == 'javascript' else 'main.py'
+    (workdir / filename).write_text(body.code, encoding='utf-8')
+    return _launch(workdir, ['python3','-u',BOOTSTRAP_PATH,str(workdir),filename,language])
 
 
 @app.post("/sessions/shell")
@@ -259,21 +263,27 @@ def start_shell(body: StartShell, authorization: Optional[str] = Header(default=
 async def start_file(file: UploadFile = File(...), authorization: Optional[str] = Header(default=None)):
     _require_auth(authorization)
     name = (file.filename or "").lower()
-    if not (name.endswith(".py") or name.endswith(".zip")):
-        raise HTTPException(400, "Upload .py or .zip")
+    if not name.endswith((".py", ".js", ".txt", ".zip")):
+        raise HTTPException(400, "Upload .py, .js, .txt or .zip")
     content = await file.read(MAX_ARCHIVE_BYTES + 1)
     if len(content) > MAX_ARCHIVE_BYTES:
         raise HTTPException(413, "File exceeds 8 MB")
     workdir = _workspace()
     try:
-        if name.endswith(".py"):
+        if not name.endswith('.zip'):
             if len(content) > MAX_SCRIPT_BYTES:
-                raise HTTPException(413, "Python script exceeds 256 KB")
-            (workdir / "main.py").write_bytes(content)
-            entry = "main.py"
+                raise HTTPException(413, 'Script exceeds 256 KB')
+            try:
+                text = content.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                raise HTTPException(400, 'The code file must be UTF-8')
+            language = detect_kind(name,text)
+            entry = 'main.js' if language=='javascript' else 'main.py'
+            (workdir / entry).write_text(text,encoding='utf-8')
         else:
             entry = _unzip_safely(content, workdir)
-        return _launch(workdir, ["python3", "-u", entry])
+            language = 'javascript' if entry.endswith('.js') else 'python'
+        return _launch(workdir, ['python3','-u',BOOTSTRAP_PATH,str(workdir),entry,language])
     except Exception:
         shutil.rmtree(workdir, ignore_errors=True)
         raise

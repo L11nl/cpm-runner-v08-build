@@ -27,4 +27,4 @@ jobs:
         with:
           context: ./runner
           push: true
-          tags: ghcr.io/${{ steps.registry.outputs.owner }}/cpm-runner:0.8
+          tags: ghcr.io/${{ steps.registry.outputs.owner }}/cpm-runner:0.9.1
